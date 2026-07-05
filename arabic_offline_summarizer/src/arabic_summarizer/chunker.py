@@ -1,23 +1,29 @@
 # src/arabic_summarizer/chunker.py
 """
 Text Chunker for Long Arabic Documents
-Handles texts that exceed model's context window
+Handles texts that exceed model context window
 """
 
-from typing import List, Tuple, Optional
 import logging
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class TextChunker:
     """
-    Splits long texts into overlapping chunks for processing.
-    
+    Splits long Arabic texts into overlapping chunks.
+
     Strategy:
-    - Split at sentence boundaries
-    - Maintain overlap for context continuity
+    - Split at sentence boundaries (no mid-sentence cuts)
+    - Overlap between chunks for context continuity
     - Merge chunk summaries intelligently
+
+    Example:
+        chunker = TextChunker(max_chars_per_chunk=3000, overlap_chars=300)
+        chunks = chunker.chunk_text(text, sentences)
+        summaries = [model.summarize(c) for c in chunks]
+        final = chunker.merge_summaries(summaries)
     """
 
     def __init__(
@@ -28,123 +34,119 @@ class TextChunker:
         self.max_chars = max_chars_per_chunk
         self.overlap_chars = overlap_chars
 
-    def split_into_chunks(
+    def should_chunk(self, text: str, threshold_chars: int = 3500) -> bool:
+        """Return True if text exceeds threshold and needs chunking"""
+        return len(text) > threshold_chars
+
+    def _get_overlap(
+        self,
+        sentences: List[str],
+        max_chars: int,
+    ) -> List[str]:
+        """Return last N sentences within max_chars overlap limit"""
+        overlap: List[str] = []
+        total = 0
+
+        for sent in reversed(sentences):
+            length = len(sent) + 2
+            if total + length > max_chars:
+                break
+            overlap.insert(0, sent)
+            total += length
+
+        return overlap
+
+    def split_into_groups(
         self,
         sentences: List[str],
         max_chars: Optional[int] = None,
     ) -> List[List[str]]:
         """
-        Split list of sentences into chunks.
-        
+        Group sentences into chunks respecting max_chars.
+
         Args:
-            sentences: List of sentences from preprocessor
-            max_chars: Override max chars per chunk
-            
+            sentences:  Pre-split sentence list
+            max_chars:  Override max chars per chunk
+
         Returns:
-            List of sentence groups (each group = one chunk)
+            List of sentence groups
         """
-        max_chars = max_chars or self.max_chars
-        
+        limit = max_chars or self.max_chars
+
         if not sentences:
             return []
 
-        chunks = []
-        current_chunk = []
-        current_length = 0
+        groups: List[List[str]] = []
+        current: List[str] = []
+        current_len = 0
 
         for sentence in sentences:
             sent_len = len(sentence) + 2  # +2 for ". "
-            
-            if current_length + sent_len > max_chars and current_chunk:
-                chunks.append(current_chunk.copy())
-                
-                # Add overlap: keep last few sentences
-                overlap_sentences = self._get_overlap_sentences(
-                    current_chunk, self.overlap_chars
-                )
-                current_chunk = overlap_sentences
-                current_length = sum(len(s) + 2 for s in overlap_sentences)
 
-            current_chunk.append(sentence)
-            current_length += sent_len
+            if current_len + sent_len > limit and current:
+                groups.append(current[:])
+                # Start next chunk with overlap
+                overlap = self._get_overlap(current, self.overlap_chars)
+                current = overlap
+                current_len = sum(len(s) + 2 for s in overlap)
 
-        if current_chunk:
-            chunks.append(current_chunk)
+            current.append(sentence)
+            current_len += sent_len
 
-        logger.debug(f"Split into {len(chunks)} chunks")
-        return chunks
+        if current:
+            groups.append(current)
 
-    def _get_overlap_sentences(
-        self,
-        sentences: List[str],
-        max_overlap_chars: int
-    ) -> List[str]:
-        """Get last N sentences within overlap character limit"""
-        overlap = []
-        total = 0
-        
-        for sent in reversed(sentences):
-            sent_len = len(sent) + 2
-            if total + sent_len > max_overlap_chars:
-                break
-            overlap.insert(0, sent)
-            total += sent_len
-
-        return overlap
+        return groups
 
     def chunk_text(
         self,
         text: str,
-        sentences: List[str]
+        sentences: List[str],
     ) -> List[str]:
         """
-        Convert sentence groups to text chunks.
-        
+        Convert text + sentences into text chunks.
+
         Args:
-            text: Original text (unused, kept for API compatibility)
-            sentences: Pre-split sentences
-            
+            text:      Original text (used as fallback)
+            sentences: Pre-split sentences from preprocessor
+
         Returns:
-            List of text strings (one per chunk)
+            List of text strings ready for model input
         """
-        sentence_groups = self.split_into_chunks(sentences)
-        return ['. '.join(group) + '.' for group in sentence_groups]
+        if not sentences:
+            return [text] if text else []
+
+        groups = self.split_into_groups(sentences)
+        chunks = [". ".join(group).rstrip(".") + "." for group in groups]
+
+        logger.debug(f"Split into {len(chunks)} chunks")
+        return chunks
 
     def merge_summaries(
         self,
-        chunk_summaries: List[str],
-        strategy: str = "concatenate"
+        summaries: List[str],
+        strategy: str = "concatenate",
     ) -> str:
         """
-        Merge summaries from multiple chunks.
-        
-        Strategies:
-        - "concatenate": Simple joining with paragraph breaks
-        - "extractive": Extract key sentences from merged text
-        
+        Merge per-chunk summaries into final summary.
+
         Args:
-            chunk_summaries: List of per-chunk summaries
-            strategy: Merging strategy
-            
+            summaries: List of chunk summaries
+            strategy:  "concatenate" (default) - join with space
+
         Returns:
-            Final merged summary
+            Merged summary string
         """
-        if not chunk_summaries:
+        if not summaries:
             return ""
 
-        if len(chunk_summaries) == 1:
-            return chunk_summaries[0]
+        if len(summaries) == 1:
+            return summaries[0].strip()
 
-        if strategy == "concatenate":
-            # Join with space, letting postprocessor handle deduplication
-            merged = ' '.join(s.rstrip('.').strip() for s in chunk_summaries)
-            if not merged.endswith('.'):
-                merged += '.'
-            return merged
+        cleaned = [s.rstrip(". ").strip() for s in summaries if s.strip()]
 
-        # Fallback
-        return ' '.join(chunk_summaries)
+        if not cleaned:
+            return ""
 
-    def should_chunk(self, text: str, threshold_chars: int = 3500) -> bool:
-        """Determine if text needs chunking"""
-        return len(text) > threshold_chars
+        merged = ". ".join(cleaned) + "."
+        return merged
